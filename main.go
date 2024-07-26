@@ -3,15 +3,39 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/google/generative-ai-go/genai"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"google.golang.org/api/option"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"path"
 	"strings"
+	"time"
 )
+
+var parameters = map[string]*genai.Schema{
+	"date": {
+		Type:        genai.TypeString,
+		Description: "Receipt date in ISO8601 format, eg. 2024-02-17",
+	},
+	"amount": {
+		Type:        genai.TypeNumber,
+		Description: "Total amount of the receipt.",
+	},
+	"shop": {
+		Type:        genai.TypeString,
+		Description: "Shop where the purchase took place.",
+	},
+	"description": {
+		Type:        genai.TypeString,
+		Description: "Brief description of the purchased articles.",
+	},
+}
+var requiredParameters = []string{"date", "amount", "shop", "description"}
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -33,6 +57,20 @@ func main() {
 	defer client.Close()
 
 	model := client.GenerativeModel("gemini-1.5-pro")
+
+	model.Tools = []*genai.Tool{
+		{
+			FunctionDeclarations: []*genai.FunctionDeclaration{{
+				Name:        "addReceipt",
+				Description: "Add a new receipt.",
+				Parameters: &genai.Schema{
+					Type:       genai.TypeObject,
+					Properties: parameters,
+					Required:   requiredParameters,
+				},
+			}},
+		},
+	}
 
 	receiptDir := os.Args[1]
 	entries, err := os.ReadDir(receiptDir)
@@ -61,9 +99,7 @@ func main() {
 	}
 }
 
-const prompt = `What's the date (ISO8601), the total amount, the shop and a brief description of the purchased articles of this receipt?
-What is your confidence (as a float between 0 (very uncertain) and 1 (completely certain)) about the correctness of the output?
-Format the output as JSON, example: {"date": "2023-10-27", "amount": "12.34", "shop": "Aldi", "description": "Groceries", "confidence": 0.8}.`
+const prompt = `Parse this receipt and pass the data to the addReceipt function.`
 
 func processReceipt(ctx context.Context, model *genai.GenerativeModel, filename string) (*expense, error) {
 	imgData, err := os.ReadFile(filename)
@@ -75,8 +111,23 @@ func processReceipt(ctx context.Context, model *genai.GenerativeModel, filename 
 		genai.ImageData("jpeg", imgData),
 		genai.Text(prompt),
 	}
-	resp, err := model.GenerateContent(ctx, prompt...)
-	if err != nil {
+	var resp *genai.GenerateContentResponse
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		resp, err = model.GenerateContent(ctx, prompt...)
+		if err == nil {
+			break
+		}
+		var apiErr *apierror.APIError
+		if errors.As(err, &apiErr) {
+			status := apiErr.HTTPCode()
+			if status == 500 || status == 503 && i < maxRetries-1 {
+				delay := time.Duration(1+rand.Intn(2<<i)) * time.Second
+				log.Printf("Gemimi returned status %d, retrying after %v", apiErr.HTTPCode(), delay)
+				time.Sleep(delay)
+				continue
+			}
+		}
 		return nil, fmt.Errorf("generateContent: %v", err)
 	}
 	if len(resp.Candidates) != 1 {
@@ -86,16 +137,37 @@ func processReceipt(ctx context.Context, model *genai.GenerativeModel, filename 
 	if len(candidate.Content.Parts) != 1 {
 		return nil, fmt.Errorf("expected 1 part, got: %d", len(candidate.Content.Parts))
 	}
-	text, ok := candidate.Content.Parts[0].(genai.Text)
+	call, ok := candidate.Content.Parts[0].(genai.FunctionCall)
 	if !ok {
-		return nil, fmt.Errorf("expected Text but got %T", text)
+		return nil, fmt.Errorf("expected FunctionCall, got: %T", candidate.Content.Parts[0])
 	}
-	jsonStr := extractJson(string(text))
-	expense := expense{FileName: filename}
-	if err := json.Unmarshal([]byte(jsonStr), &expense); err != nil {
-		return nil, fmt.Errorf("unmarshal(%s): %v", jsonStr, err)
+	if call.Name != "addReceipt" {
+		return nil, fmt.Errorf("expected addReceipt, got: %s", call.Name)
 	}
-	return &expense, nil
+	args := call.Args
+
+	for _, parameter := range requiredParameters {
+		if _, ok := args[parameter]; !ok {
+			return nil, fmt.Errorf("args (%v) is missing required parameter %s", args, parameter)
+		}
+		ok := false
+		switch parameters[parameter].Type {
+		case genai.TypeString:
+			_, ok = args[parameter].(string)
+		case genai.TypeNumber:
+			_, ok = args[parameter].(float64)
+		}
+		if !ok {
+			return nil, fmt.Errorf("parameter %s must be %v, got: %T", parameter, parameters[parameter].Type, args[parameter])
+		}
+	}
+
+	return &expense{
+		Date:        args["date"].(string),
+		Amount:      args["amount"].(float64),
+		Shop:        args["shop"].(string),
+		Description: args["description"].(string),
+	}, nil
 }
 
 func extractJson(text string) string {
@@ -107,8 +179,7 @@ func extractJson(text string) string {
 type expense struct {
 	FileName    string  `json:"filename"`
 	Date        string  `json:"date"`
-	Amount      string  `json:"amount"`
+	Amount      float64 `json:"amount"`
 	Shop        string  `json:"shop"`
 	Description string  `json:"description"`
-	Confidence  float64 `json:"confidence"`
 }
