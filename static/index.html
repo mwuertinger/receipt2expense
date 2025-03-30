@@ -2,16 +2,81 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1, minimum-scale=1">
     <title>Camera Capture</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        video {
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+        }
+
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            display: none;
+        }
+
+        .controls {
+            position: absolute;
+            bottom: 10px;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        #camera-select {
+            margin-bottom: 10px;
+        }
+
+        .button-container {
+            display: flex;
+            gap: 10px;
+        }
+
+        button {
+            font-size: 16px;
+            padding: 10px;
+        }
+
+        #loading {
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+        }
+    </style>
 </head>
 <body>
-<h1>Take a Photo</h1>
-<select id="camera-select"></select>
 <video id="video" autoplay></video>
-<button id="capture">Take Photo</button>
-<button id="flashlight-toggle">Toggle Flashlight</button>
-<canvas id="canvas" style="display: none;"></canvas>
+<canvas id="canvas"></canvas>
+<div id="loading">Uploading...</div>
+<div class="controls">
+    <select id="camera-select"></select>
+    <div class="button-container">
+        <button id="capture">Take Photo</button>
+        <button id="flashlight-toggle">Toggle Flashlight</button>
+    </div>
+</div>
 <div id="expense-details"></div>
 
 <script>
@@ -34,7 +99,14 @@
     async function setupCamera(deviceId = null) {
         try {
             const constraints = {
-                video: deviceId ? { deviceId: { exact: deviceId } } : true
+                video: {
+                    deviceId: deviceId ? {exact: deviceId} : undefined,
+                    width: {ideal: 9999},
+                    height: {ideal: 9999},
+                    focusMode: "continuous",
+                    exposureMode: "continuous",
+                    whiteBalanceMode: "continuous"
+                }
             };
             const stream = await navigator.mediaDevices.getUserMedia(constraints);
             const video = document.getElementById('video');
@@ -46,9 +118,12 @@
         }
     }
 
-    function toggleFlashlight(turnOn) {
+    flashLight = false;
+
+    function toggleFlashlight() {
+        flashLight = !flashLight;
         if (videoTrack && videoTrack.getCapabilities().torch) {
-            videoTrack.applyConstraints({ advanced: [{ torch: turnOn }] });
+            videoTrack.applyConstraints({advanced: [{torch: flashLight}]});
         } else {
             alert("Flashlight is not supported on this device.");
         }
@@ -57,10 +132,20 @@
     async function captureAndUpload() {
         const video = document.getElementById('video');
         const canvas = document.getElementById('canvas');
+        const loadingIndicator = document.getElementById('loading');
+        const detailsDiv = document.getElementById('expense-details');
         const ctx = canvas.getContext('2d');
+
+        flashLight = true;
+        toggleFlashlight();
+
+        video.style.display = 'none';
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        loadingIndicator.style.display = 'block';
+        detailsDiv.innerHTML = '';
 
         canvas.toBlob(async (blob) => {
             if (!blob) {
@@ -71,17 +156,22 @@
             try {
                 const response = await fetch("/receipt", {
                     method: "POST",
+                    headers: {"Content-Type": "image/jpeg"},
                     body: blob,
                 });
 
+                loadingIndicator.style.display = 'none';
+
                 if (response.ok) {
                     const expense = await response.json();
+                    video.style.display = 'none';
                     displayExpenseDetails(expense);
                 } else {
                     console.error("Upload failed", response.statusText);
                 }
             } catch (error) {
                 console.error("Error uploading image:", error);
+                loadingIndicator.style.display = 'none';
             }
         }, "image/jpeg");
     }
@@ -99,7 +189,7 @@
     }
 
     document.getElementById('capture').addEventListener('click', captureAndUpload);
-    document.getElementById('flashlight-toggle').addEventListener('click', () => toggleFlashlight(true));
+    document.getElementById('flashlight-toggle').addEventListener('click', () => toggleFlashlight());
     document.getElementById('camera-select').addEventListener('change', (event) => setupCamera(event.target.value));
 
     getCameras().then(setupCamera);
