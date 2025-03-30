@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camera Capture</title>
+</head>
+<body>
+<h1>Take a Photo</h1>
+<select id="camera-select"></select>
+<video id="video" autoplay></video>
+<button id="capture">Take Photo</button>
+<button id="flashlight-toggle">Toggle Flashlight</button>
+<canvas id="canvas" style="display: none;"></canvas>
+<div id="expense-details"></div>
+
+<script>
+    let videoTrack;
+
+    async function getCameras() {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoDevices = devices.filter(device => device.kind === "videoinput");
+
+        const select = document.getElementById("camera-select");
+        select.innerHTML = "";
+        videoDevices.forEach((device, index) => {
+            const option = document.createElement("option");
+            option.value = device.deviceId;
+            option.textContent = device.label || `Camera ${index + 1}`;
+            select.appendChild(option);
+        });
+    }
+
+    async function setupCamera(deviceId = null) {
+        try {
+            const constraints = {
+                video: deviceId ? { deviceId: { exact: deviceId } } : true
+            };
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
+            const video = document.getElementById('video');
+            video.srcObject = stream;
+
+            videoTrack = stream.getVideoTracks()[0];
+        } catch (error) {
+            console.error("Error accessing camera:", error);
+        }
+    }
+
+    function toggleFlashlight(turnOn) {
+        if (videoTrack && videoTrack.getCapabilities().torch) {
+            videoTrack.applyConstraints({ advanced: [{ torch: turnOn }] });
+        } else {
+            alert("Flashlight is not supported on this device.");
+        }
+    }
+
+    async function captureAndUpload() {
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        canvas.toBlob(async (blob) => {
+            if (!blob) {
+                console.error("Failed to create blob from canvas");
+                return;
+            }
+
+            try {
+                const response = await fetch("/receipt", {
+                    method: "POST",
+                    body: blob,
+                });
+
+                if (response.ok) {
+                    const expense = await response.json();
+                    displayExpenseDetails(expense);
+                } else {
+                    console.error("Upload failed", response.statusText);
+                }
+            } catch (error) {
+                console.error("Error uploading image:", error);
+            }
+        }, "image/jpeg");
+    }
+
+    function displayExpenseDetails(expense) {
+        const detailsDiv = document.getElementById('expense-details');
+        detailsDiv.innerHTML = `
+                <h2>Expense Details</h2>
+                <p><strong>File Name:</strong> ${expense.filename}</p>
+                <p><strong>Date:</strong> ${expense.date}</p>
+                <p><strong>Amount:</strong> ${expense.amount}</p>
+                <p><strong>Shop:</strong> ${expense.shop}</p>
+                <p><strong>Description:</strong> ${expense.description}</p>
+            `;
+    }
+
+    document.getElementById('capture').addEventListener('click', captureAndUpload);
+    document.getElementById('flashlight-toggle').addEventListener('click', () => toggleFlashlight(true));
+    document.getElementById('camera-select').addEventListener('change', (event) => setupCamera(event.target.value));
+
+    getCameras().then(setupCamera);
+</script>
+</body>
+</html>

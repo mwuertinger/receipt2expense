@@ -5,16 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"time"
+
 	"github.com/google/generative-ai-go/genai"
 	"github.com/googleapis/gax-go/v2/apierror"
 	"google.golang.org/api/option"
-	"log"
-	"math/rand"
-	"os"
-	"os/signal"
-	"path"
-	"strings"
-	"time"
 )
 
 var parameters = map[string]*genai.Schema{
@@ -50,7 +52,7 @@ func main() {
 	}()
 
 	// Access your API key as an environment variable (see "Set up your API key" above)
-	client, err := genai.NewClient(ctx, option.WithAPIKey(os.Getenv("API_KEY")))
+	client, err := genai.NewClient(ctx, option.WithAPIKey(os.Getenv("GEMINI_API_KEY")))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -72,46 +74,59 @@ func main() {
 		},
 	}
 
-	receiptDir := os.Args[1]
-	entries, err := os.ReadDir(receiptDir)
-	if err != nil {
-		log.Fatalf("readdir: %v", err)
-	}
-	var expenses []*expense
-	for _, entry := range entries {
-		if ctx.Err() != nil {
-			break
+	// Serve static files (HTML, JS, CSS, etc.)
+	fs := http.FileServer(http.Dir("static"))
+	http.Handle("/", fs)
+
+	http.HandleFunc("/receipt", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
-		if entry.IsDir() {
-			continue
+		if r.Header.Get("Content-Type") != "image/jpeg" {
+			fmt.Fprintf(w, "jpeg image required, got: %s", r.Header.Get("Content-Type"))
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
-		expense, err := processReceipt(ctx, model, path.Join(receiptDir, entry.Name()))
+		jpegImage, err := io.ReadAll(r.Body)
 		if err != nil {
-			log.Printf("%s: %v", entry.Name(), err)
+			fmt.Fprintf(w, "failed to read body: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		expense, err := processReceipt(ctx, model, jpegImage)
+		if err != nil {
+			log.Printf("gemini error: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
 		}
 		jsonStr, err := json.Marshal(expense)
 		if err != nil {
-			log.Printf("%s: %v", entry.Name(), err)
+			log.Printf("failed to marshal expense: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
 		}
-		fmt.Println(string(jsonStr))
 
-		expenses = append(expenses, expense)
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write(jsonStr); err != nil {
+			log.Printf("failed to write response: %v", err)
+		}
+	})
+
+	err = http.ListenAndServeTLS("[::]:8080", "cert.pem", "key.pem", nil)
+	if err != nil {
+		fmt.Println("Error starting server:", err)
 	}
 }
 
 const prompt = `Parse this receipt and pass the data to the addReceipt function.`
 
-func processReceipt(ctx context.Context, model *genai.GenerativeModel, filename string) (*expense, error) {
-	imgData, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("readFile: %v", err)
-	}
-
+func processReceipt(ctx context.Context, model *genai.GenerativeModel, jpegImage []byte) (*expense, error) {
 	prompt := []genai.Part{
-		genai.ImageData("jpeg", imgData),
+		genai.ImageData("jpeg", jpegImage),
 		genai.Text(prompt),
 	}
 	var resp *genai.GenerateContentResponse
+	var err error
 	maxRetries := 5
 	for i := 0; i < maxRetries; i++ {
 		resp, err = model.GenerateContent(ctx, prompt...)
